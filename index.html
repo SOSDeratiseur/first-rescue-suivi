@@ -1,0 +1,871 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>First Rescue — Suivi des formations</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script src="https://unpkg.com/@supabase/supabase-js@2"></script>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700;800&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
+  body { font-family: 'Archivo', sans-serif; background: #FAFAF8; margin: 0; }
+  .mono { font-family: 'IBM Plex Mono', monospace; }
+  .input { width: 100%; border: 1px solid #E4E1D8; border-radius: 10px; padding: 9px 12px; font-size: 14px; outline: none; background: #fff; color: #14171F; }
+  .input:focus { border-color: #D7263D; }
+  #cert-area { display: none; }
+  @media print {
+    body * { visibility: hidden; }
+    #cert-area, #cert-area * { visibility: visible; }
+    #cert-area { display: block !important; position: fixed; inset: 0; }
+  }
+  canvas { -webkit-user-drag: none; user-select: none; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useCallback, useRef } = React;
+
+/* ================= CONFIG ================= */
+const SUPABASE_URL = "https://iusmlkohrxeptpmjfode.supabase.co";
+const SUPABASE_KEY = "sb_publishable_Lddw4SlGC1o_LyCbK2K6ow__UDp6Krr";
+const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+
+const SESSION_TYPES = [
+  "SST Entreprise — 2 jours (16h)",
+  "SST Entreprise — 3 jours (21h)",
+  "Formation grand public",
+  "Recyclage / remise à niveau",
+  "Autre",
+];
+
+/* ================= HELPERS ================= */
+const genCode = (len = 6) => {
+  const chars = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
+  let out = "";
+  for (let i = 0; i < len; i++) out += chars[Math.floor(Math.random() * chars.length)];
+  return out;
+};
+const addMonths = (dateStr, months) => {
+  const d = new Date(dateStr + "T00:00:00");
+  d.setMonth(d.getMonth() + Number(months || 0));
+  return d.toISOString().slice(0, 10);
+};
+const fmtDate = (dateStr) => {
+  if (!dateStr) return "—";
+  return new Date(dateStr + "T00:00:00").toLocaleDateString("fr-BE", { day: "2-digit", month: "long", year: "numeric" });
+};
+const daysUntil = (dateStr) => {
+  if (!dateStr) return null;
+  const today = new Date(); today.setHours(0, 0, 0, 0);
+  return Math.round((new Date(dateStr + "T00:00:00") - today) / 86400000);
+};
+function statusFor(p) {
+  if (p.statut_brevet === "en_attente") return { label: "En attente de résultat", tone: "wait" };
+  if (p.statut_brevet === "echoue") return { label: "Non obtenu", tone: "fail" };
+  const dleft = daysUntil(p.date_echeance);
+  if (dleft === null) return { label: "Obtenu", tone: "ok" };
+  if (dleft < 0) return { label: `En retard de ${Math.abs(dleft)} j`, tone: "late" };
+  if (dleft <= 60) return { label: `À renouveler dans ${dleft} j`, tone: "soon" };
+  return { label: "À jour", tone: "ok" };
+}
+const TONE_STYLES = {
+  ok: { bg: "#EAF6EF", fg: "#1E8E5A", ring: "#BFE6CE" },
+  soon: { bg: "#FDF3E4", fg: "#C67C1E", ring: "#F2D8AC" },
+  late: { bg: "#FCEAEC", fg: "#D7263D", ring: "#F3C1C8" },
+  fail: { bg: "#F1F1EE", fg: "#6B6B63", ring: "#DEDED6" },
+  wait: { bg: "#EAF0FA", fg: "#2A5FA5", ring: "#C7D8F0" },
+};
+const buildClientLink = (mode, nom, code) => {
+  const url = new URL(window.location.href.split("#")[0]);
+  url.searchParams.set("espace", "client");
+  url.searchParams.set("mode", mode);
+  url.searchParams.set("nom", nom);
+  url.searchParams.set("code", code);
+  return url.toString();
+};
+const copyText = async (text) => { try { await navigator.clipboard.writeText(text); return true; } catch { return false; } };
+
+/* ================= ICONS (texte, léger) ================= */
+function Icon({ children, size = 16, color, style = {} }) {
+  return <span style={{ fontSize: size, color, lineHeight: 1, display: "inline-block", ...style }}>{children}</span>;
+}
+
+function Pulse({ className = "" }) {
+  return (
+    <svg viewBox="0 0 300 40" className={className} preserveAspectRatio="none">
+      <polyline points="0,20 60,20 78,20 88,4 98,36 108,20 300,20" fill="none" stroke="#D7263D" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  );
+}
+
+function Badge({ tone, children }) {
+  const s = TONE_STYLES[tone] || TONE_STYLES.wait;
+  return (
+    <span style={{ background: s.bg, color: s.fg, border: `1px solid ${s.ring}` }} className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold whitespace-nowrap">
+      {children}
+    </span>
+  );
+}
+
+/* ================= DB LAYER ================= */
+const DEFAULT_SETTINGS = { id: 1, pin: "1234", default_validity_months: 12, org_email: "tfirstrescue@gmail.com", org_phone: "" };
+
+async function fetchTable(table) {
+  const { data, error } = await sb.from(table).select("*");
+  if (error) { console.error(table, error); return []; }
+  return data || [];
+}
+async function fetchSettings() {
+  const { data, error } = await sb.from("app_settings").select("*").eq("id", 1).single();
+  if (error || !data) return DEFAULT_SETTINGS;
+  return data;
+}
+async function insertRow(table, obj) {
+  const { data, error } = await sb.from(table).insert(obj).select().single();
+  if (error) { alert("Erreur d'enregistrement : " + error.message); return null; }
+  return data;
+}
+async function updateRow(table, id, obj) {
+  const { error } = await sb.from(table).update(obj).eq("id", id);
+  if (error) { alert("Erreur de mise à jour : " + error.message); return false; }
+  return true;
+}
+async function deleteRow(table, id) {
+  const { error } = await sb.from(table).delete().eq("id", id);
+  if (error) { alert("Erreur de suppression : " + error.message); return false; }
+  return true;
+}
+
+/* ================= ROOT ================= */
+function App() {
+  const [loading, setLoading] = useState(true);
+  const [sessions, setSessions] = useState([]);
+  const [participants, setParticipants] = useState([]);
+  const [companies, setCompanies] = useState([]);
+  const [courses, setCourses] = useState([]);
+  const [settings, setSettings] = useState(DEFAULT_SETTINGS);
+  const [view, setView] = useState("landing");
+  const [printParticipant, setPrintParticipant] = useState(null);
+  const [clientPrefill, setClientPrefill] = useState(null);
+
+  const reload = useCallback(async () => {
+    const [s, p, c, co, st] = await Promise.all([
+      fetchTable("sessions"), fetchTable("participants"), fetchTable("companies"), fetchTable("courses"), fetchSettings(),
+    ]);
+    setSessions(s); setParticipants(p); setCompanies(c); setCourses(co); setSettings(st);
+  }, []);
+
+  useEffect(() => {
+    reload().then(() => setLoading(false));
+    const params = new URLSearchParams(window.location.search);
+    if (params.get("espace") === "client") {
+      setClientPrefill({ mode: params.get("mode") === "entreprise" ? "entreprise" : "particulier", nom: params.get("nom") || "", code: params.get("code") || "" });
+      setView("client");
+    }
+  }, [reload]);
+
+  if (loading) {
+    return (
+      <div style={{ background: "#FAFAF8" }} className="min-h-screen flex items-center justify-center">
+        <div className="flex flex-col items-center gap-3">
+          <Icon size={28} color="#D7263D">♥</Icon>
+          <p className="mono text-sm text-gray-500">Chargement…</p>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div style={{ background: "#FAFAF8" }} className="min-h-screen">
+      {view === "landing" && <Landing onAdmin={() => setView("admin-login")} onClient={() => setView("client")} />}
+      {view === "admin-login" && <AdminLogin pin={settings.pin} onBack={() => setView("landing")} onSuccess={() => setView("admin")} />}
+      {view === "admin" && (
+        <AdminSpace
+          sessions={sessions} participants={participants} companies={companies} courses={courses} settings={settings}
+          reload={reload} onExit={() => setView("landing")} onPrint={setPrintParticipant}
+        />
+      )}
+      {view === "client" && (
+        <ClientSpace sessions={sessions} participants={participants} companies={companies} courses={courses}
+          onBack={() => setView("landing")} onPrint={setPrintParticipant} prefill={clientPrefill} />
+      )}
+      {printParticipant && (
+        <CertificateOverlay participant={printParticipant} session={sessions.find((s) => s.id === printParticipant.session_id)} settings={settings} onClose={() => setPrintParticipant(null)} />
+      )}
+    </div>
+  );
+}
+
+/* ================= LANDING ================= */
+function Landing({ onAdmin, onClient }) {
+  return (
+    <div className="min-h-screen flex flex-col">
+      <div className="flex-1 flex flex-col items-center justify-center px-6 py-16">
+        <div className="flex items-center gap-2 mb-2">
+          <Icon color="#D7263D">♥</Icon>
+          <span className="mono text-xs font-semibold tracking-[0.2em] uppercase" style={{ color: "#D7263D" }}>First Rescue</span>
+        </div>
+        <h1 style={{ color: "#14171F" }} className="text-3xl sm:text-4xl font-extrabold text-center max-w-md leading-tight">Suivi des formations en secourisme</h1>
+        <Pulse className="w-48 h-8 my-6" />
+        <p style={{ color: "#6B6B63" }} className="text-center max-w-sm text-sm mb-10">Inscriptions, brevets, échéances de recyclage, cours en ligne et attestations.</p>
+        <div className="grid sm:grid-cols-2 gap-4 w-full max-w-2xl">
+          <button onClick={onAdmin} className="group text-left rounded-2xl p-6 transition-all hover:-translate-y-0.5" style={{ background: "#14171F", color: "#FAFAF8" }}>
+            <Icon color="#D7263D" size={20}>🛡</Icon>
+            <p className="font-bold text-lg mt-3">Espace formateur</p>
+            <p className="text-sm opacity-70 mt-1">Sessions, stagiaires, brevets, cours, attestations.</p>
+            <div className="flex items-center gap-1 text-xs mt-4 opacity-80 group-hover:opacity-100">Accéder <Icon size={14}>›</Icon></div>
+          </button>
+          <button onClick={onClient} className="group text-left rounded-2xl p-6 border transition-all hover:-translate-y-0.5" style={{ background: "#fff", borderColor: "#E4E1D8", color: "#14171F" }}>
+            <Icon color="#D7263D" size={20}>👥</Icon>
+            <p className="font-bold text-lg mt-3">Espace stagiaire &amp; entreprise</p>
+            <p className="text-sm mt-1" style={{ color: "#6B6B63" }}>Suivre son certificat et le cours en ligne.</p>
+            <div className="flex items-center gap-1 text-xs mt-4" style={{ color: "#D7263D" }}>Vérifier mon certificat <Icon size={14}>›</Icon></div>
+          </button>
+        </div>
+      </div>
+      <p className="mono text-center text-[11px] pb-6" style={{ color: "#B3B0A6" }}>First Rescue — Formations &amp; Interventions</p>
+    </div>
+  );
+}
+
+/* ================= ADMIN LOGIN ================= */
+function AdminLogin({ pin, onBack, onSuccess }) {
+  const [val, setVal] = useState("");
+  const [err, setErr] = useState(false);
+  const submit = (e) => { e.preventDefault(); if (val === pin) onSuccess(); else { setErr(true); setVal(""); } };
+  return (
+    <div className="min-h-screen flex items-center justify-center px-6">
+      <div className="w-full max-w-xs">
+        <button onClick={onBack} className="flex items-center gap-1 text-xs mb-6" style={{ color: "#6B6B63" }}><Icon size={14}>←</Icon> Retour</button>
+        <Icon size={22} color="#D7263D">🛡</Icon>
+        <h2 className="text-xl font-bold mt-3 mb-1" style={{ color: "#14171F" }}>Espace formateur</h2>
+        <p className="text-sm mb-5" style={{ color: "#6B6B63" }}>Entrez le code d'accès.</p>
+        <form onSubmit={submit}>
+          <input autoFocus type="password" inputMode="numeric" value={val} onChange={(e) => { setVal(e.target.value); setErr(false); }}
+            className="mono w-full border rounded-xl px-4 py-3 text-lg tracking-widest text-center outline-none" style={{ borderColor: err ? "#D7263D" : "#E4E1D8" }} placeholder="••••" />
+          {err && <p className="text-xs mt-2" style={{ color: "#D7263D" }}>Code incorrect.</p>}
+          <button type="submit" className="w-full mt-4 rounded-xl py-3 font-semibold text-sm" style={{ background: "#D7263D", color: "#fff" }}>Entrer</button>
+        </form>
+      </div>
+    </div>
+  );
+}
+
+/* ================= ADMIN SPACE ================= */
+function AdminSpace({ sessions, participants, companies, courses, settings, reload, onExit, onPrint }) {
+  const [tab, setTab] = useState("dashboard");
+  return (
+    <div className="min-h-screen pb-16">
+      <div className="border-b" style={{ borderColor: "#E4E1D8" }}>
+        <div className="max-w-5xl mx-auto px-4 sm:px-6 py-4 flex items-center justify-between">
+          <div className="flex items-center gap-2"><Icon color="#D7263D">♥</Icon><span className="mono text-xs font-semibold tracking-widest uppercase">Espace formateur</span></div>
+          <button onClick={onExit} className="flex items-center gap-1 text-xs font-medium" style={{ color: "#6B6B63" }}>Quitter</button>
+        </div>
+      </div>
+      <div className="max-w-5xl mx-auto px-4 sm:px-6">
+        <div className="flex gap-1 overflow-x-auto py-4 -mx-1 px-1">
+          {[["dashboard", "Vue d'ensemble"], ["sessions", "Sessions"], ["participants", "Stagiaires"], ["cours", "Cours"], ["settings", "Réglages"]].map(([id, label]) => (
+            <button key={id} onClick={() => setTab(id)} className="px-3.5 py-2 rounded-lg text-sm font-semibold whitespace-nowrap"
+              style={tab === id ? { background: "#14171F", color: "#fff" } : { background: "#fff", color: "#6B6B63", border: "1px solid #E4E1D8" }}>{label}</button>
+          ))}
+        </div>
+        {tab === "dashboard" && <Dashboard sessions={sessions} participants={participants} />}
+        {tab === "sessions" && <SessionsTab sessions={sessions} participants={participants} reload={reload} />}
+        {tab === "participants" && <ParticipantsTab sessions={sessions} participants={participants} companies={companies} settings={settings} reload={reload} onPrint={onPrint} />}
+        {tab === "cours" && <CoursTab courses={courses} reload={reload} />}
+        {tab === "settings" && <SettingsTab settings={settings} companies={companies} reload={reload} />}
+      </div>
+    </div>
+  );
+}
+
+function Dashboard({ sessions, participants }) {
+  const counts = { ok: 0, soon: 0, late: 0, fail: 0, wait: 0 };
+  participants.forEach((p) => { counts[statusFor(p).tone]++; });
+  const upcoming = [...sessions].filter((s) => s.date && s.date >= new Date().toISOString().slice(0, 10)).sort((a, b) => a.date.localeCompare(b.date)).slice(0, 5);
+  const cards = [
+    { label: "À jour", value: counts.ok, tone: "ok" }, { label: "À renouveler bientôt", value: counts.soon, tone: "soon" },
+    { label: "En retard", value: counts.late, tone: "late" }, { label: "En attente / échoué", value: counts.wait + counts.fail, tone: "wait" },
+  ];
+  return (
+    <div className="pb-10">
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-8">
+        {cards.map((c) => { const s = TONE_STYLES[c.tone]; return (
+          <div key={c.label} className="rounded-xl p-4" style={{ background: s.bg, border: `1px solid ${s.ring}` }}>
+            <p className="text-2xl font-extrabold mt-1" style={{ color: s.fg }}>{c.value}</p>
+            <p className="text-xs mt-0.5" style={{ color: s.fg }}>{c.label}</p>
+          </div>
+        );})}
+      </div>
+      <h3 className="font-bold mb-3 text-sm uppercase tracking-wide" style={{ color: "#6B6B63" }}>Prochaines sessions</h3>
+      {upcoming.length === 0 && <p className="text-sm" style={{ color: "#B3B0A6" }}>Aucune session à venir programmée.</p>}
+      <div className="space-y-2">
+        {upcoming.map((s) => (
+          <div key={s.id} className="flex items-center justify-between rounded-xl px-4 py-3 bg-white border" style={{ borderColor: "#E4E1D8" }}>
+            <div><p className="font-semibold text-sm" style={{ color: "#14171F" }}>{s.titre || s.type}</p><p className="text-xs" style={{ color: "#6B6B63" }}>{s.type}{s.entreprise ? ` · ${s.entreprise}` : ""}</p></div>
+            <span className="mono text-xs font-semibold" style={{ color: "#D7263D" }}>{fmtDate(s.date)}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/* ================= SESSIONS ================= */
+function SessionsTab({ sessions, participants, reload }) {
+  const [form, setForm] = useState(null);
+  const countFor = (id) => participants.filter((p) => p.session_id === id).length;
+  const submit = async (data) => {
+    if (data.id) await updateRow("sessions", data.id, { titre: data.titre, type: data.type, date: data.date || null, lieu: data.lieu, entreprise: data.entreprise });
+    else await insertRow("sessions", { titre: data.titre, type: data.type, date: data.date || null, lieu: data.lieu, entreprise: data.entreprise });
+    setForm(null); reload();
+  };
+  const remove = async (s) => {
+    if (countFor(s.id) > 0) { alert("Impossible de supprimer : des stagiaires sont inscrits à cette session."); return; }
+    if (confirm(`Supprimer la session « ${s.titre || s.type} » ?`)) { await deleteRow("sessions", s.id); reload(); }
+  };
+  return (
+    <div className="pb-10">
+      <div className="flex items-center justify-between mb-4">
+        <h2 className="font-bold text-lg" style={{ color: "#14171F" }}>Sessions</h2>
+        <button onClick={() => setForm({})} className="flex items-center gap-1.5 text-sm font-semibold px-3 py-2 rounded-lg" style={{ background: "#D7263D", color: "#fff" }}>+ Nouvelle session</button>
+      </div>
+      {sessions.length === 0 && <EmptyState text="Aucune session pour le moment." />}
+      <div className="space-y-2">
+        {[...sessions].sort((a, b) => (b.date || "").localeCompare(a.date || "")).map((s) => (
+          <div key={s.id} className="rounded-xl bg-white border px-4 py-3.5 flex items-start justify-between gap-3" style={{ borderColor: "#E4E1D8" }}>
+            <div className="min-w-0">
+              <p className="font-semibold text-sm" style={{ color: "#14171F" }}>{s.titre || s.type}</p>
+              <p className="text-xs mt-0.5" style={{ color: "#6B6B63" }}>{s.type}</p>
+              <div className="flex flex-wrap gap-x-3 gap-y-1 mt-1.5 text-xs" style={{ color: "#6B6B63" }}>
+                <span>{fmtDate(s.date)}</span>{s.lieu && <span>· {s.lieu}</span>}{s.entreprise && <span>· {s.entreprise}</span>}<span>· {countFor(s.id)} stagiaire(s)</span>
+              </div>
+            </div>
+            <div className="flex gap-1 shrink-0">
+              <button onClick={() => setForm(s)} className="p-2 rounded-lg hover:bg-gray-50"><Icon>✎</Icon></button>
+              <button onClick={() => remove(s)} className="p-2 rounded-lg hover:bg-gray-50"><Icon color="#D7263D">🗑</Icon></button>
+            </div>
+          </div>
+        ))}
+      </div>
+      {form !== null && <SessionForm initial={form} onCancel={() => setForm(null)} onSubmit={submit} />}
+    </div>
+  );
+}
+function SessionForm({ initial, onCancel, onSubmit }) {
+  const [data, setData] = useState({ titre: initial.titre || "", type: initial.type || SESSION_TYPES[0], date: initial.date || "", lieu: initial.lieu || "", entreprise: initial.entreprise || "", id: initial.id });
+  return (
+    <Modal onClose={onCancel} title={initial.id ? "Modifier la session" : "Nouvelle session"}>
+      <form onSubmit={(e) => { e.preventDefault(); onSubmit(data); }} className="space-y-3">
+        <Field label="Titre (optionnel)"><input value={data.titre} onChange={(e) => setData({ ...data, titre: e.target.value })} className="input" /></Field>
+        <Field label="Type de formation"><select value={data.type} onChange={(e) => setData({ ...data, type: e.target.value })} className="input">{SESSION_TYPES.map((t) => <option key={t} value={t}>{t}</option>)}</select></Field>
+        <Field label="Date"><input type="date" value={data.date} onChange={(e) => setData({ ...data, date: e.target.value })} className="input" /></Field>
+        <Field label="Lieu"><input value={data.lieu} onChange={(e) => setData({ ...data, lieu: e.target.value })} className="input" /></Field>
+        <Field label="Entreprise cliente"><input value={data.entreprise} onChange={(e) => setData({ ...data, entreprise: e.target.value })} className="input" /></Field>
+        <ModalActions onCancel={onCancel} submitLabel="Enregistrer" />
+      </form>
+    </Modal>
+  );
+}
+
+/* ================= PARTICIPANTS ================= */
+function ParticipantsTab({ sessions, participants, companies, settings, reload, onPrint }) {
+  const [form, setForm] = useState(null);
+  const [filterStatut, setFilterStatut] = useState("tous");
+  const [q, setQ] = useState("");
+
+  const ensureCompany = async (name) => {
+    if (!name) return;
+    const exists = companies.find((c) => c.nom.toLowerCase() === name.toLowerCase());
+    if (!exists) await insertRow("companies", { nom: name, code: genCode(6) });
+  };
+
+  const submit = async (data) => {
+    if (data.entreprise) await ensureCompany(data.entreprise);
+    const date_echeance = data.statut_brevet === "obtenu" && data.date_obtention ? addMonths(data.date_obtention, data.duree_validite_mois) : null;
+    const record = {
+      prenom: data.prenom, nom: data.nom, email: data.email, telephone: data.telephone, entreprise: data.entreprise || null,
+      session_id: data.session_id || null, statut_brevet: data.statut_brevet, date_obtention: data.date_obtention || null,
+      duree_validite_mois: Number(data.duree_validite_mois), date_echeance,
+    };
+    if (data.id) await updateRow("participants", data.id, record);
+    else await insertRow("participants", { ...record, code_acces: genCode(6), acces_cours: true });
+    setForm(null); reload();
+  };
+  const remove = async (p) => { if (confirm(`Retirer ${p.prenom} ${p.nom} ?`)) { await deleteRow("participants", p.id); reload(); } };
+  const toggleCours = async (p) => { await updateRow("participants", p.id, { acces_cours: !p.acces_cours }); reload(); };
+
+  const filtered = participants
+    .filter((p) => (filterStatut === "tous" ? true : statusFor(p).tone === filterStatut))
+    .filter((p) => `${p.prenom} ${p.nom} ${p.entreprise || ""}`.toLowerCase().includes(q.toLowerCase()))
+    .sort((a, b) => a.nom.localeCompare(b.nom));
+
+  return (
+    <div className="pb-10">
+      <div className="flex items-center justify-between mb-4 gap-2 flex-wrap">
+        <h2 className="font-bold text-lg" style={{ color: "#14171F" }}>Stagiaires</h2>
+        <button onClick={() => setForm({})} className="flex items-center gap-1.5 text-sm font-semibold px-3 py-2 rounded-lg" style={{ background: "#D7263D", color: "#fff" }}>+ Inscrire un stagiaire</button>
+      </div>
+      <div className="flex gap-2 mb-4 flex-wrap">
+        <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Rechercher…" className="input flex-1 min-w-[180px]" />
+        <select value={filterStatut} onChange={(e) => setFilterStatut(e.target.value)} className="input w-auto">
+          <option value="tous">Tous les statuts</option><option value="ok">À jour</option><option value="soon">À renouveler bientôt</option>
+          <option value="late">En retard</option><option value="wait">En attente</option><option value="fail">Non obtenu</option>
+        </select>
+      </div>
+      {filtered.length === 0 && <EmptyState text="Aucun stagiaire ne correspond." />}
+      <div className="space-y-2">
+        {filtered.map((p) => {
+          const st = statusFor(p);
+          const session = sessions.find((s) => s.id === p.session_id);
+          return (
+            <div key={p.id} className="rounded-xl bg-white border px-4 py-3.5" style={{ borderColor: "#E4E1D8" }}>
+              <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <p className="font-semibold text-sm" style={{ color: "#14171F" }}>{p.prenom} {p.nom}</p>
+                  <p className="text-xs mt-0.5" style={{ color: "#6B6B63" }}>{session ? (session.titre || session.type) : "Session non définie"}{p.entreprise ? ` · ${p.entreprise}` : ""}</p>
+                  <div className="flex items-center gap-2 mt-2 flex-wrap">
+                    <Badge tone={st.tone}>{st.label}</Badge>
+                    {p.statut_brevet === "obtenu" && <span className="mono text-[11px]" style={{ color: "#B3B0A6" }}>échéance {fmtDate(p.date_echeance)}</span>}
+                    <button onClick={() => copyText(p.code_acces)} className="mono text-[11px] flex items-center gap-1 border rounded px-1.5 py-0.5" style={{ color: "#6B6B63" }}>code {p.code_acces}</button>
+                    <button onClick={async () => { const ok = await copyText(buildClientLink("particulier", p.nom, p.code_acces)); alert(ok ? "Lien copié." : "Erreur de copie."); }} className="text-[11px] flex items-center gap-1 border rounded px-1.5 py-0.5 font-semibold" style={{ color: "#D7263D" }}>🔗 copier le lien</button>
+                    <button onClick={() => toggleCours(p)} className="text-[11px] flex items-center gap-1 border rounded px-1.5 py-0.5 font-semibold" style={p.acces_cours ? { color: "#1E8E5A" } : { color: "#D7263D" }}>
+                      {p.acces_cours ? "🔓 cours autorisé" : "🔒 cours bloqué"}
+                    </button>
+                  </div>
+                </div>
+                <div className="flex gap-1 shrink-0">
+                  {p.statut_brevet === "obtenu" && <button onClick={() => onPrint(p)} className="p-2 rounded-lg hover:bg-gray-50"><Icon>🖨</Icon></button>}
+                  <button onClick={() => setForm(p)} className="p-2 rounded-lg hover:bg-gray-50"><Icon>✎</Icon></button>
+                  <button onClick={() => remove(p)} className="p-2 rounded-lg hover:bg-gray-50"><Icon color="#D7263D">🗑</Icon></button>
+                </div>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+      {form !== null && <ParticipantForm initial={form} sessions={sessions} onCancel={() => setForm(null)} onSubmit={submit} defaultValidityMonths={settings.default_validity_months} />}
+    </div>
+  );
+}
+function ParticipantForm({ initial, sessions, onCancel, onSubmit, defaultValidityMonths }) {
+  const [data, setData] = useState({
+    prenom: initial.prenom || "", nom: initial.nom || "", email: initial.email || "", telephone: initial.telephone || "",
+    entreprise: initial.entreprise || "", session_id: initial.session_id || (sessions[0] ? sessions[0].id : ""),
+    statut_brevet: initial.statut_brevet || "en_attente", date_obtention: initial.date_obtention || "",
+    duree_validite_mois: initial.duree_validite_mois || defaultValidityMonths || 12, id: initial.id,
+  });
+  return (
+    <Modal onClose={onCancel} title={initial.id ? "Modifier le stagiaire" : "Inscrire un stagiaire"}>
+      <form onSubmit={(e) => { e.preventDefault(); onSubmit(data); }} className="space-y-3">
+        <div className="grid grid-cols-2 gap-3">
+          <Field label="Prénom"><input required value={data.prenom} onChange={(e) => setData({ ...data, prenom: e.target.value })} className="input" /></Field>
+          <Field label="Nom"><input required value={data.nom} onChange={(e) => setData({ ...data, nom: e.target.value })} className="input" /></Field>
+        </div>
+        <Field label="Email"><input type="email" value={data.email} onChange={(e) => setData({ ...data, email: e.target.value })} className="input" /></Field>
+        <Field label="Téléphone"><input value={data.telephone} onChange={(e) => setData({ ...data, telephone: e.target.value })} className="input" /></Field>
+        <Field label="Entreprise (si inscription pro)"><input value={data.entreprise} onChange={(e) => setData({ ...data, entreprise: e.target.value })} className="input" /></Field>
+        <Field label="Session">
+          <select value={data.session_id} onChange={(e) => setData({ ...data, session_id: e.target.value })} className="input">
+            <option value="">— Aucune —</option>
+            {sessions.map((s) => <option key={s.id} value={s.id}>{(s.titre || s.type)} · {fmtDate(s.date)}</option>)}
+          </select>
+        </Field>
+        <Field label="Statut du brevet">
+          <select value={data.statut_brevet} onChange={(e) => setData({ ...data, statut_brevet: e.target.value })} className="input">
+            <option value="en_attente">En attente de résultat</option><option value="obtenu">Obtenu</option><option value="echoue">Non obtenu</option>
+          </select>
+        </Field>
+        {data.statut_brevet === "obtenu" && (
+          <div className="grid grid-cols-2 gap-3">
+            <Field label="Date d'obtention"><input required type="date" value={data.date_obtention} onChange={(e) => setData({ ...data, date_obtention: e.target.value })} className="input" /></Field>
+            <Field label="Validité (mois)"><input required type="number" min="1" value={data.duree_validite_mois} onChange={(e) => setData({ ...data, duree_validite_mois: e.target.value })} className="input" /></Field>
+          </div>
+        )}
+        <ModalActions onCancel={onCancel} submitLabel="Enregistrer" />
+      </form>
+    </Modal>
+  );
+}
+
+/* ================= COURS (admin) ================= */
+function CoursTab({ courses, reload }) {
+  const [selectedType, setSelectedType] = useState(SESSION_TYPES[0]);
+  const [slides, setSlides] = useState([]);
+  const [busy, setBusy] = useState(false);
+  const fileInput = useRef(null);
+
+  const course = courses.find((c) => c.type === selectedType);
+
+  const loadSlides = useCallback(async (courseId) => {
+    if (!courseId) { setSlides([]); return; }
+    const { data } = await sb.from("course_slides").select("*").eq("course_id", courseId).order("ordre", { ascending: true });
+    setSlides(data || []);
+  }, []);
+
+  useEffect(() => { loadSlides(course?.id); }, [course?.id, loadSlides]);
+
+  const ensureCourse = async () => {
+    if (course) return course;
+    return await insertRow("courses", { type: selectedType, titre: selectedType });
+  };
+
+  const uploadFiles = async (files) => {
+    setBusy(true);
+    const c = await ensureCourse();
+    if (!c) { setBusy(false); return; }
+    let ordre = slides.length;
+    for (const file of files) {
+      const path = `${c.id}/${Date.now()}-${Math.random().toString(36).slice(2, 8)}-${file.name}`;
+      const { error } = await sb.storage.from("cours").upload(path, file);
+      if (error) { alert("Erreur upload : " + error.message); continue; }
+      await insertRow("course_slides", { course_id: c.id, ordre: ordre++, storage_path: path });
+    }
+    await reload();
+    await loadSlides(c.id);
+    setBusy(false);
+  };
+
+  const move = async (slide, dir) => {
+    const idx = slides.findIndex((s) => s.id === slide.id);
+    const swapIdx = idx + dir;
+    if (swapIdx < 0 || swapIdx >= slides.length) return;
+    const other = slides[swapIdx];
+    await updateRow("course_slides", slide.id, { ordre: other.ordre });
+    await updateRow("course_slides", other.id, { ordre: slide.ordre });
+    await loadSlides(course.id);
+  };
+  const removeSlide = async (slide) => {
+    if (!confirm("Supprimer cette diapo ?")) return;
+    await sb.storage.from("cours").remove([slide.storage_path]);
+    await deleteRow("course_slides", slide.id);
+    await loadSlides(course.id);
+  };
+
+  return (
+    <div className="pb-10 max-w-2xl">
+      <h2 className="font-bold text-lg mb-4" style={{ color: "#14171F" }}>Cours en ligne</h2>
+      <Field label="Type de formation">
+        <select value={selectedType} onChange={(e) => setSelectedType(e.target.value)} className="input">
+          {SESSION_TYPES.map((t) => <option key={t} value={t}>{t}</option>)}
+        </select>
+      </Field>
+      <p className="text-xs mt-2 mb-4" style={{ color: "#B3B0A6" }}>
+        Chaque type de formation a son propre cours. Les stagiaires inscrits à une session de ce type voient ce cours dans leur espace, s'ils sont autorisés.
+      </p>
+
+      <div className="rounded-xl border-dashed border-2 p-6 text-center mb-6" style={{ borderColor: "#E4E1D8" }}>
+        <input ref={fileInput} type="file" accept="image/*" multiple className="hidden" onChange={(e) => e.target.files.length && uploadFiles(Array.from(e.target.files))} />
+        <button disabled={busy} onClick={() => fileInput.current.click()} className="text-sm font-semibold px-4 py-2 rounded-lg" style={{ background: "#14171F", color: "#fff" }}>
+          {busy ? "Envoi en cours…" : "⬆ Ajouter des diapos (images)"}
+        </button>
+        <p className="text-[11px] mt-2" style={{ color: "#B3B0A6" }}>Exporte tes diapos PowerPoint en PNG/JPG puis sélectionne-les ici (plusieurs à la fois possible).</p>
+      </div>
+
+      {slides.length === 0 && <EmptyState text="Aucune diapo pour ce cours pour le moment." />}
+      <div className="space-y-2">
+        {slides.map((s, i) => (
+          <div key={s.id} className="flex items-center gap-3 bg-white border rounded-xl px-3 py-2" style={{ borderColor: "#E4E1D8" }}>
+            <span className="mono text-xs w-6 text-center" style={{ color: "#B3B0A6" }}>{i + 1}</span>
+            <SlideThumb path={s.storage_path} />
+            <span className="text-xs flex-1 truncate" style={{ color: "#6B6B63" }}>{s.storage_path.split("/").pop()}</span>
+            <button onClick={() => move(s, -1)} disabled={i === 0} className="px-2 py-1 text-xs rounded border disabled:opacity-30" style={{ borderColor: "#E4E1D8" }}>↑</button>
+            <button onClick={() => move(s, 1)} disabled={i === slides.length - 1} className="px-2 py-1 text-xs rounded border disabled:opacity-30" style={{ borderColor: "#E4E1D8" }}>↓</button>
+            <button onClick={() => removeSlide(s)} className="px-2 py-1 text-xs rounded border" style={{ borderColor: "#F3C1C8", color: "#D7263D" }}>🗑</button>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+function SlideThumb({ path }) {
+  const [url, setUrl] = useState(null);
+  useEffect(() => {
+    let revoke;
+    sb.storage.from("cours").download(path).then(({ data }) => { if (data) { revoke = URL.createObjectURL(data); setUrl(revoke); } });
+    return () => { if (revoke) URL.revokeObjectURL(revoke); };
+  }, [path]);
+  return url ? <img src={url} className="w-12 h-8 object-cover rounded border" style={{ borderColor: "#E4E1D8" }} /> : <div className="w-12 h-8 rounded bg-gray-100" />;
+}
+
+/* ================= SETTINGS ================= */
+function SettingsTab({ settings, companies, reload }) {
+  const [local, setLocal] = useState(settings);
+  const dirty = JSON.stringify(local) !== JSON.stringify(settings);
+  const save = async () => { await updateRow("app_settings", 1, { pin: local.pin, default_validity_months: local.default_validity_months, org_email: local.org_email, org_phone: local.org_phone }); reload(); };
+  return (
+    <div className="pb-10 max-w-md">
+      <h2 className="font-bold text-lg mb-4" style={{ color: "#14171F" }}>Réglages</h2>
+      <div className="space-y-3 bg-white border rounded-xl p-4" style={{ borderColor: "#E4E1D8" }}>
+        <Field label="Code d'accès formateur"><input value={local.pin} onChange={(e) => setLocal({ ...local, pin: e.target.value })} className="input" /></Field>
+        <Field label="Durée de validité par défaut (mois)">
+          <input type="number" min="1" value={local.default_validity_months} onChange={(e) => setLocal({ ...local, default_validity_months: e.target.value })} className="input" />
+          <p className="text-[11px] mt-1" style={{ color: "#B3B0A6" }}>Un brevet est valable 12 mois et doit être renouvelé par un recyclage.</p>
+        </Field>
+        <Field label="Email affiché sur les attestations"><input value={local.org_email} onChange={(e) => setLocal({ ...local, org_email: e.target.value })} className="input" /></Field>
+        <Field label="Téléphone affiché sur les attestations"><input value={local.org_phone} onChange={(e) => setLocal({ ...local, org_phone: e.target.value })} className="input" /></Field>
+        <button disabled={!dirty} onClick={save} className="w-full rounded-lg py-2.5 text-sm font-semibold mt-2" style={{ background: dirty ? "#D7263D" : "#E4E1D8", color: dirty ? "#fff" : "#B3B0A6" }}>Enregistrer</button>
+      </div>
+      {companies.length > 0 && (
+        <div className="mt-6">
+          <h3 className="font-bold mb-3 text-sm uppercase tracking-wide" style={{ color: "#6B6B63" }}>Codes d'accès entreprises</h3>
+          <div className="space-y-1.5">
+            {companies.map((c) => (
+              <div key={c.id} className="flex items-center justify-between rounded-lg bg-white border px-3 py-2" style={{ borderColor: "#E4E1D8" }}>
+                <span className="text-sm font-medium" style={{ color: "#14171F" }}>{c.nom}</span>
+                <div className="flex items-center gap-2">
+                  <span className="mono text-xs font-semibold" style={{ color: "#D7263D" }}>{c.code}</span>
+                  <button onClick={async () => { await copyText(buildClientLink("entreprise", c.nom, c.code)); alert("Lien copié."); }} className="text-[11px] border rounded px-1.5 py-0.5 font-semibold" style={{ color: "#D7263D" }}>🔗 lien</button>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ================= CLIENT SPACE ================= */
+function ClientSpace({ sessions, participants, companies, courses, onBack, onPrint, prefill }) {
+  const [mode, setMode] = useState(prefill?.mode || "particulier");
+  const [nom, setNom] = useState(prefill?.nom || "");
+  const [code, setCode] = useState(prefill?.code || "");
+  const [result, setResult] = useState(undefined);
+  const [showCourse, setShowCourse] = useState(false);
+
+  const runSearch = useCallback((m, n, c) => {
+    if (m === "particulier") {
+      const found = participants.find((p) => p.nom.toLowerCase() === n.trim().toLowerCase() && p.code_acces.toUpperCase() === c.trim().toUpperCase());
+      setResult(found || null);
+    } else {
+      const comp = companies.find((co) => co.nom.toLowerCase() === n.trim().toLowerCase() && co.code.toUpperCase() === c.trim().toUpperCase());
+      setResult(comp ? { company: comp } : null);
+    }
+  }, [participants, companies]);
+
+  useEffect(() => { if (prefill?.nom && prefill?.code) runSearch(prefill.mode, prefill.nom, prefill.code); }, []);
+
+  const search = (e) => { e.preventDefault(); runSearch(mode, nom, code); };
+
+  if (showCourse && result && !result.company) {
+    const session = sessions.find((s) => s.id === result.session_id);
+    const course = courses.find((c) => c.type === session?.type);
+    return <CourseViewer course={course} onClose={() => setShowCourse(false)} />;
+  }
+
+  return (
+    <div className="min-h-screen">
+      <div className="max-w-md mx-auto px-6 py-10">
+        <button onClick={onBack} className="flex items-center gap-1 text-xs mb-6" style={{ color: "#6B6B63" }}>← Retour</button>
+        <div className="flex items-center gap-2 mb-1"><Icon color="#D7263D">♥</Icon><span className="mono text-xs font-semibold tracking-widest uppercase" style={{ color: "#D7263D" }}>First Rescue</span></div>
+        <h2 className="text-xl font-bold mb-5" style={{ color: "#14171F" }}>Suivre mon certificat</h2>
+        <div className="flex gap-1 mb-4">
+          {[["particulier", "Stagiaire"], ["entreprise", "Entreprise"]].map(([id, label]) => (
+            <button key={id} onClick={() => { setMode(id); setResult(undefined); setNom(""); setCode(""); }} className="px-3.5 py-2 rounded-lg text-sm font-semibold"
+              style={mode === id ? { background: "#14171F", color: "#fff" } : { background: "#fff", color: "#6B6B63", border: "1px solid #E4E1D8" }}>{label}</button>
+          ))}
+        </div>
+        <form onSubmit={search} className="space-y-3 bg-white border rounded-xl p-4" style={{ borderColor: "#E4E1D8" }}>
+          <Field label={mode === "particulier" ? "Nom de famille" : "Nom de l'entreprise"}><input required value={nom} onChange={(e) => setNom(e.target.value)} className="input" /></Field>
+          <Field label="Code d'accès"><input required value={code} onChange={(e) => setCode(e.target.value)} className="input mono uppercase" placeholder="Ex. K3F7QZ" /></Field>
+          <button type="submit" className="w-full rounded-lg py-2.5 text-sm font-semibold" style={{ background: "#D7263D", color: "#fff" }}>Vérifier</button>
+        </form>
+        {result === null && <p className="text-sm mt-4 text-center" style={{ color: "#D7263D" }}>Aucune correspondance. Vérifiez le nom et le code.</p>}
+        {result && !result.company && <ParticipantResultCard participant={result} session={sessions.find((s) => s.id === result.session_id)} courses={courses} onPrint={onPrint} onOpenCourse={() => setShowCourse(true)} />}
+        {result && result.company && <CompanyResultCard company={result.company} participants={participants.filter((p) => (p.entreprise || "").toLowerCase() === result.company.nom.toLowerCase())} sessions={sessions} />}
+      </div>
+    </div>
+  );
+}
+
+function ParticipantResultCard({ participant, session, courses, onPrint, onOpenCourse }) {
+  const st = statusFor(participant);
+  const s = TONE_STYLES[st.tone];
+  const course = courses.find((c) => c.type === session?.type);
+  return (
+    <div className="mt-5 rounded-xl p-5" style={{ background: s.bg, border: `1px solid ${s.ring}` }}>
+      <p className="font-bold text-lg" style={{ color: "#14171F" }}>{participant.prenom} {participant.nom}</p>
+      <p className="text-xs mb-3" style={{ color: "#6B6B63" }}>{session ? (session.titre || session.type) : "—"}</p>
+      <Badge tone={st.tone}>{st.label}</Badge>
+      {participant.statut_brevet === "obtenu" && (
+        <div className="mt-3 text-sm space-y-1" style={{ color: "#14171F" }}>
+          <p>Obtenu le <strong>{fmtDate(participant.date_obtention)}</strong></p>
+          <p>Échéance de recyclage : <strong>{fmtDate(participant.date_echeance)}</strong></p>
+        </div>
+      )}
+      <div className="flex flex-wrap gap-2 mt-4">
+        {participant.statut_brevet === "obtenu" && (
+          <button onClick={() => onPrint(participant)} className="flex items-center gap-1.5 text-xs font-semibold px-3 py-2 rounded-lg" style={{ background: "#14171F", color: "#fff" }}>🖨 Mon attestation</button>
+        )}
+        {course && participant.acces_cours && (
+          <button onClick={onOpenCourse} className="flex items-center gap-1.5 text-xs font-semibold px-3 py-2 rounded-lg" style={{ background: "#D7263D", color: "#fff" }}>📖 Voir le cours</button>
+        )}
+        {course && !participant.acces_cours && <p className="text-xs" style={{ color: "#D7263D" }}>🔒 Accès au cours actuellement bloqué par votre formateur.</p>}
+      </div>
+    </div>
+  );
+}
+function CompanyResultCard({ company, participants, sessions }) {
+  return (
+    <div className="mt-5">
+      <p className="font-bold text-lg mb-3" style={{ color: "#14171F" }}>{company.nom}</p>
+      {participants.length === 0 && <p className="text-sm" style={{ color: "#B3B0A6" }}>Aucun collaborateur enregistré.</p>}
+      <div className="space-y-2">
+        {participants.map((p) => {
+          const st = statusFor(p);
+          const session = sessions.find((s) => s.id === p.session_id);
+          return (
+            <div key={p.id} className="rounded-lg bg-white border px-3.5 py-3" style={{ borderColor: "#E4E1D8" }}>
+              <div className="flex items-center justify-between gap-2">
+                <div><p className="font-semibold text-sm" style={{ color: "#14171F" }}>{p.prenom} {p.nom}</p><p className="text-xs" style={{ color: "#6B6B63" }}>{session ? (session.titre || session.type) : "—"}</p></div>
+                <Badge tone={st.tone}>{st.label}</Badge>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+/* ================= COURSE VIEWER (view-only) ================= */
+function CourseViewer({ course, onClose }) {
+  const [slides, setSlides] = useState([]);
+  const [idx, setIdx] = useState(0);
+  const [loading, setLoading] = useState(true);
+  const canvasRef = useRef(null);
+
+  useEffect(() => {
+    if (!course) { setLoading(false); return; }
+    sb.from("course_slides").select("*").eq("course_id", course.id).order("ordre", { ascending: true }).then(({ data }) => { setSlides(data || []); setLoading(false); });
+  }, [course]);
+
+  useEffect(() => {
+    if (!slides[idx]) return;
+    let revoke;
+    sb.storage.from("cours").download(slides[idx].storage_path).then(({ data }) => {
+      if (!data) return;
+      const url = URL.createObjectURL(data); revoke = url;
+      const img = new Image();
+      img.onload = () => {
+        const canvas = canvasRef.current;
+        if (!canvas) return;
+        const ratio = Math.min(1000 / img.width, 700 / img.height, 1);
+        canvas.width = img.width * ratio; canvas.height = img.height * ratio;
+        const ctx = canvas.getContext("2d");
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+      };
+      img.src = url;
+    });
+    return () => { if (revoke) URL.revokeObjectURL(revoke); };
+  }, [slides, idx]);
+
+  if (!course) {
+    return (
+      <div className="min-h-screen flex flex-col items-center justify-center px-6">
+        <p className="text-sm" style={{ color: "#6B6B63" }}>Aucun cours n'est encore disponible pour cette formation.</p>
+        <button onClick={onClose} className="mt-4 text-sm font-semibold px-4 py-2 rounded-lg" style={{ background: "#14171F", color: "#fff" }}>Retour</button>
+      </div>
+    );
+  }
+
+  return (
+    <div className="min-h-screen flex flex-col items-center px-4 py-8" onContextMenu={(e) => e.preventDefault()}>
+      <div className="w-full max-w-2xl flex items-center justify-between mb-4">
+        <button onClick={onClose} className="text-xs font-semibold" style={{ color: "#6B6B63" }}>← Retour</button>
+        <span className="mono text-xs" style={{ color: "#B3B0A6" }}>{course.titre}</span>
+      </div>
+      {loading && <p className="text-sm" style={{ color: "#B3B0A6" }}>Chargement du cours…</p>}
+      {!loading && slides.length === 0 && <p className="text-sm" style={{ color: "#B3B0A6" }}>Ce cours ne contient pas encore de contenu.</p>}
+      {slides.length > 0 && (
+        <>
+          <div className="rounded-xl overflow-hidden shadow-lg border bg-white" style={{ borderColor: "#E4E1D8" }}>
+            <canvas ref={canvasRef} className="max-w-full" style={{ display: "block" }} onContextMenu={(e) => e.preventDefault()} draggable={false} />
+          </div>
+          <div className="flex items-center gap-4 mt-5">
+            <button onClick={() => setIdx((i) => Math.max(0, i - 1))} disabled={idx === 0} className="px-4 py-2 rounded-lg text-sm font-semibold disabled:opacity-30" style={{ background: "#14171F", color: "#fff" }}>‹ Précédent</button>
+            <span className="mono text-xs" style={{ color: "#6B6B63" }}>{idx + 1} / {slides.length}</span>
+            <button onClick={() => setIdx((i) => Math.min(slides.length - 1, i + 1))} disabled={idx === slides.length - 1} className="px-4 py-2 rounded-lg text-sm font-semibold disabled:opacity-30" style={{ background: "#14171F", color: "#fff" }}>Suivant ›</button>
+          </div>
+          <p className="text-[11px] mt-6 text-center max-w-sm" style={{ color: "#B3B0A6" }}>Ce contenu est réservé à votre usage personnel dans le cadre de votre formation. Merci de ne pas le partager.</p>
+        </>
+      )}
+    </div>
+  );
+}
+
+/* ================= CERTIFICATE ================= */
+function CertificateOverlay({ participant, session, settings, onClose }) {
+  useEffect(() => { const id = setTimeout(() => window.print(), 300); return () => clearTimeout(id); }, []);
+  return (
+    <div className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center p-4">
+      <div className="absolute top-4 right-4 flex gap-2" style={{ zIndex: 60 }}>
+        <button onClick={() => window.print()} className="text-xs font-semibold px-3 py-2 rounded-lg bg-white">🖨 Imprimer / PDF</button>
+        <button onClick={onClose} className="p-2 rounded-lg bg-white">✕</button>
+      </div>
+      <div id="cert-area" style={{ display: "block" }} className="bg-white w-full max-w-2xl rounded-lg overflow-hidden shadow-2xl">
+        <div style={{ background: "#14171F", padding: "28px 40px" }} className="flex items-center gap-2">
+          <Icon color="#D7263D">♥</Icon>
+          <span className="mono text-xs font-semibold tracking-[0.2em] uppercase" style={{ color: "#fff" }}>First Rescue — Formations &amp; Interventions</span>
+        </div>
+        <div style={{ padding: "40px" }}>
+          <p className="mono text-xs font-semibold tracking-[0.2em] uppercase mb-2" style={{ color: "#D7263D" }}>Attestation de formation</p>
+          <h1 style={{ color: "#14171F" }} className="text-2xl font-extrabold mb-6">{session ? (session.titre || session.type) : "Secourisme en entreprise"}</h1>
+          <p className="text-sm mb-1" style={{ color: "#6B6B63" }}>Délivrée à</p>
+          <p className="text-xl font-bold mb-6" style={{ color: "#14171F" }}>{participant.prenom} {participant.nom}</p>
+          <div className="grid grid-cols-2 gap-6 mb-8">
+            <div><p className="text-xs uppercase tracking-wide" style={{ color: "#B3B0A6" }}>Date d'obtention</p><p className="font-semibold" style={{ color: "#14171F" }}>{fmtDate(participant.date_obtention)}</p></div>
+            <div><p className="text-xs uppercase tracking-wide" style={{ color: "#B3B0A6" }}>Échéance de recyclage</p><p className="font-semibold" style={{ color: "#14171F" }}>{fmtDate(participant.date_echeance)}</p></div>
+          </div>
+          <svg viewBox="0 0 300 30" className="w-full h-6 mb-8"><polyline points="0,15 60,15 78,15 88,2 98,28 108,15 300,15" fill="none" stroke="#D7263D" strokeWidth="2" /></svg>
+          <p className="text-sm" style={{ color: "#6B6B63" }}>Ce document atteste que le titulaire a suivi avec succès la formation mentionnée ci-dessus, dispensée par First Rescue — Formations &amp; Interventions.</p>
+          <div className="flex justify-between items-end mt-12 pt-6 border-t" style={{ borderColor: "#E4E1D8" }}>
+            <div className="mono text-[11px]" style={{ color: "#B3B0A6" }}>{settings.org_email}{settings.org_phone ? ` · ${settings.org_phone}` : ""}</div>
+            <div className="text-right"><p className="text-xs" style={{ color: "#B3B0A6" }}>Signature du formateur</p><div className="w-32 border-b mt-6" style={{ borderColor: "#14171F" }} /></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ================= SHARED UI ================= */
+function Modal({ title, children, onClose }) {
+  return (
+    <div className="fixed inset-0 z-40 bg-black/40 flex items-end sm:items-center justify-center p-0 sm:p-4">
+      <div className="bg-white w-full sm:max-w-md rounded-t-2xl sm:rounded-2xl max-h-[90vh] overflow-y-auto">
+        <div className="flex items-center justify-between px-5 py-4 border-b sticky top-0 bg-white" style={{ borderColor: "#E4E1D8" }}>
+          <h3 className="font-bold" style={{ color: "#14171F" }}>{title}</h3>
+          <button onClick={onClose}>✕</button>
+        </div>
+        <div className="p-5">{children}</div>
+      </div>
+    </div>
+  );
+}
+function ModalActions({ onCancel, submitLabel }) {
+  return (
+    <div className="flex gap-2 pt-2">
+      <button type="button" onClick={onCancel} className="flex-1 rounded-lg py-2.5 text-sm font-semibold" style={{ background: "#F1F1EE", color: "#6B6B63" }}>Annuler</button>
+      <button type="submit" className="flex-1 rounded-lg py-2.5 text-sm font-semibold" style={{ background: "#D7263D", color: "#fff" }}>{submitLabel}</button>
+    </div>
+  );
+}
+function Field({ label, children }) {
+  return <label className="block"><span className="block text-xs font-semibold mb-1" style={{ color: "#6B6B63" }}>{label}</span>{children}</label>;
+}
+function EmptyState({ text }) {
+  return <div className="rounded-xl border border-dashed py-10 text-center" style={{ borderColor: "#E4E1D8" }}><p className="text-sm" style={{ color: "#B3B0A6" }}>{text}</p></div>;
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>
