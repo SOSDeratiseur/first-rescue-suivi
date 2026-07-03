@@ -9,6 +9,7 @@
 <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
 <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
 <style>
   @import url('https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700;800&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
   body { font-family: 'Archivo', sans-serif; background: #FAFAF8; margin: 0; }
@@ -34,6 +35,7 @@ const { useState, useEffect, useCallback, useRef } = React;
 const SUPABASE_URL = "https://iusmlkohrxeptpmjfode.supabase.co";
 const SUPABASE_KEY = "sb_publishable_Lddw4SlGC1o_LyCbK2K6ow__UDp6Krr";
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
 
 const SESSION_TYPES = [
   "SST Entreprise — 2 jours (16h)",
@@ -496,55 +498,42 @@ function ParticipantForm({ initial, sessions, onCancel, onSubmit, defaultValidit
 /* ================= COURS (admin) ================= */
 function CoursTab({ courses, reload }) {
   const [selectedType, setSelectedType] = useState(SESSION_TYPES[0]);
-  const [slides, setSlides] = useState([]);
   const [busy, setBusy] = useState(false);
+  const [pageCount, setPageCount] = useState(null);
   const fileInput = useRef(null);
 
   const course = courses.find((c) => c.type === selectedType);
 
-  const loadSlides = useCallback(async (courseId) => {
-    if (!courseId) { setSlides([]); return; }
-    const { data } = await sb.from("course_slides").select("*").eq("course_id", courseId).order("ordre", { ascending: true });
-    setSlides(data || []);
-  }, []);
+  useEffect(() => {
+    setPageCount(null);
+    if (!course?.pdf_path) return;
+    sb.storage.from("cours").download(course.pdf_path).then(async ({ data }) => {
+      if (!data) return;
+      const buf = await data.arrayBuffer();
+      const pdf = await pdfjsLib.getDocument({ data: buf }).promise;
+      setPageCount(pdf.numPages);
+    });
+  }, [course?.pdf_path]);
 
-  useEffect(() => { loadSlides(course?.id); }, [course?.id, loadSlides]);
-
-  const ensureCourse = async () => {
-    if (course) return course;
-    return await insertRow("courses", { type: selectedType, titre: selectedType });
-  };
-
-  const uploadFiles = async (files) => {
+  const uploadPdf = async (file) => {
+    if (file.type !== "application/pdf") { alert("Merci de sélectionner un fichier PDF (Enregistrer sous → PDF depuis PowerPoint)."); return; }
     setBusy(true);
-    const c = await ensureCourse();
+    let c = course;
+    if (!c) c = await insertRow("courses", { type: selectedType, titre: selectedType });
     if (!c) { setBusy(false); return; }
-    let ordre = slides.length;
-    for (const file of files) {
-      const path = `${c.id}/${Date.now()}-${Math.random().toString(36).slice(2, 8)}-${file.name}`;
-      const { error } = await sb.storage.from("cours").upload(path, file);
-      if (error) { alert("Erreur upload : " + error.message); continue; }
-      await insertRow("course_slides", { course_id: c.id, ordre: ordre++, storage_path: path });
-    }
+    const path = `${c.id}/cours.pdf`;
+    const { error } = await sb.storage.from("cours").upload(path, file, { upsert: true });
+    if (error) { alert("Erreur upload : " + error.message); setBusy(false); return; }
+    await updateRow("courses", c.id, { pdf_path: path, titre: selectedType, updated_at: new Date().toISOString() });
     await reload();
-    await loadSlides(c.id);
     setBusy(false);
   };
 
-  const move = async (slide, dir) => {
-    const idx = slides.findIndex((s) => s.id === slide.id);
-    const swapIdx = idx + dir;
-    if (swapIdx < 0 || swapIdx >= slides.length) return;
-    const other = slides[swapIdx];
-    await updateRow("course_slides", slide.id, { ordre: other.ordre });
-    await updateRow("course_slides", other.id, { ordre: slide.ordre });
-    await loadSlides(course.id);
-  };
-  const removeSlide = async (slide) => {
-    if (!confirm("Supprimer cette diapo ?")) return;
-    await sb.storage.from("cours").remove([slide.storage_path]);
-    await deleteRow("course_slides", slide.id);
-    await loadSlides(course.id);
+  const removePdf = async () => {
+    if (!course?.pdf_path || !confirm("Supprimer le cours de ce type de formation ?")) return;
+    await sb.storage.from("cours").remove([course.pdf_path]);
+    await updateRow("courses", course.id, { pdf_path: null });
+    await reload();
   };
 
   return (
@@ -556,41 +545,32 @@ function CoursTab({ courses, reload }) {
         </select>
       </Field>
       <p className="text-xs mt-2 mb-4" style={{ color: "#B3B0A6" }}>
-        Chaque type de formation a son propre cours. Les stagiaires inscrits à une session de ce type voient ce cours dans leur espace, s'ils sont autorisés.
+        Un seul PDF par type de formation. Les stagiaires inscrits à une session de ce type le voient dans leur espace, s'ils sont autorisés.
       </p>
 
-      <div className="rounded-xl border-dashed border-2 p-6 text-center mb-6" style={{ borderColor: "#E4E1D8" }}>
-        <input ref={fileInput} type="file" accept="image/*" multiple className="hidden" onChange={(e) => e.target.files.length && uploadFiles(Array.from(e.target.files))} />
-        <button disabled={busy} onClick={() => fileInput.current.click()} className="text-sm font-semibold px-4 py-2 rounded-lg" style={{ background: "#14171F", color: "#fff" }}>
-          {busy ? "Envoi en cours…" : "⬆ Ajouter des diapos (images)"}
-        </button>
-        <p className="text-[11px] mt-2" style={{ color: "#B3B0A6" }}>Exporte tes diapos PowerPoint en PNG/JPG puis sélectionne-les ici (plusieurs à la fois possible).</p>
-      </div>
-
-      {slides.length === 0 && <EmptyState text="Aucune diapo pour ce cours pour le moment." />}
-      <div className="space-y-2">
-        {slides.map((s, i) => (
-          <div key={s.id} className="flex items-center gap-3 bg-white border rounded-xl px-3 py-2" style={{ borderColor: "#E4E1D8" }}>
-            <span className="mono text-xs w-6 text-center" style={{ color: "#B3B0A6" }}>{i + 1}</span>
-            <SlideThumb path={s.storage_path} />
-            <span className="text-xs flex-1 truncate" style={{ color: "#6B6B63" }}>{s.storage_path.split("/").pop()}</span>
-            <button onClick={() => move(s, -1)} disabled={i === 0} className="px-2 py-1 text-xs rounded border disabled:opacity-30" style={{ borderColor: "#E4E1D8" }}>↑</button>
-            <button onClick={() => move(s, 1)} disabled={i === slides.length - 1} className="px-2 py-1 text-xs rounded border disabled:opacity-30" style={{ borderColor: "#E4E1D8" }}>↓</button>
-            <button onClick={() => removeSlide(s)} className="px-2 py-1 text-xs rounded border" style={{ borderColor: "#F3C1C8", color: "#D7263D" }}>🗑</button>
+      {course?.pdf_path ? (
+        <div className="rounded-xl bg-white border px-4 py-3.5 mb-4 flex items-center justify-between" style={{ borderColor: "#E4E1D8" }}>
+          <div>
+            <p className="font-semibold text-sm" style={{ color: "#14171F" }}>📄 Cours actuel</p>
+            <p className="text-xs mt-0.5" style={{ color: "#6B6B63" }}>{pageCount ? `${pageCount} page(s)` : "Chargement…"}</p>
           </div>
-        ))}
+          <button onClick={removePdf} className="text-xs font-semibold border rounded px-2 py-1" style={{ borderColor: "#F3C1C8", color: "#D7263D" }}>🗑 Retirer</button>
+        </div>
+      ) : (
+        <EmptyState text="Aucun cours pour ce type de formation pour le moment." />
+      )}
+
+      <div className="rounded-xl border-dashed border-2 p-6 text-center mt-4" style={{ borderColor: "#E4E1D8" }}>
+        <input ref={fileInput} type="file" accept="application/pdf" className="hidden" onChange={(e) => e.target.files.length && uploadPdf(e.target.files[0])} />
+        <button disabled={busy} onClick={() => fileInput.current.click()} className="text-sm font-semibold px-4 py-2 rounded-lg" style={{ background: "#14171F", color: "#fff" }}>
+          {busy ? "Envoi en cours…" : course?.pdf_path ? "⬆ Remplacer le PDF" : "⬆ Ajouter le cours (PDF)"}
+        </button>
+        <p className="text-[11px] mt-2" style={{ color: "#B3B0A6" }}>
+          Depuis PowerPoint : Fichier → Enregistrer sous → format PDF, puis sélectionne ce fichier ici.
+        </p>
       </div>
     </div>
   );
-}
-function SlideThumb({ path }) {
-  const [url, setUrl] = useState(null);
-  useEffect(() => {
-    let revoke;
-    sb.storage.from("cours").download(path).then(({ data }) => { if (data) { revoke = URL.createObjectURL(data); setUrl(revoke); } });
-    return () => { if (revoke) URL.revokeObjectURL(revoke); };
-  }, [path]);
-  return url ? <img src={url} className="w-12 h-8 object-cover rounded border" style={{ borderColor: "#E4E1D8" }} /> : <div className="w-12 h-8 rounded bg-gray-100" />;
 }
 
 /* ================= SETTINGS ================= */
@@ -734,40 +714,48 @@ function CompanyResultCard({ company, participants, sessions }) {
   );
 }
 
-/* ================= COURSE VIEWER (view-only) ================= */
+/* ================= COURSE VIEWER (view-only, PDF) ================= */
 function CourseViewer({ course, onClose }) {
-  const [slides, setSlides] = useState([]);
-  const [idx, setIdx] = useState(0);
+  const [pdf, setPdf] = useState(null);
+  const [numPages, setNumPages] = useState(0);
+  const [idx, setIdx] = useState(1);
   const [loading, setLoading] = useState(true);
   const canvasRef = useRef(null);
 
   useEffect(() => {
-    if (!course) { setLoading(false); return; }
-    sb.from("course_slides").select("*").eq("course_id", course.id).order("ordre", { ascending: true }).then(({ data }) => { setSlides(data || []); setLoading(false); });
-  }, [course]);
+    if (!course?.pdf_path) { setLoading(false); return; }
+    let cancelled = false;
+    sb.storage.from("cours").download(course.pdf_path).then(async ({ data }) => {
+      if (!data || cancelled) { setLoading(false); return; }
+      const buf = await data.arrayBuffer();
+      const doc = await pdfjsLib.getDocument({ data: buf }).promise;
+      if (cancelled) return;
+      setPdf(doc);
+      setNumPages(doc.numPages);
+      setLoading(false);
+    });
+    return () => { cancelled = true; };
+  }, [course?.pdf_path]);
 
   useEffect(() => {
-    if (!slides[idx]) return;
-    let revoke;
-    sb.storage.from("cours").download(slides[idx].storage_path).then(({ data }) => {
-      if (!data) return;
-      const url = URL.createObjectURL(data); revoke = url;
-      const img = new Image();
-      img.onload = () => {
-        const canvas = canvasRef.current;
-        if (!canvas) return;
-        const ratio = Math.min(1000 / img.width, 700 / img.height, 1);
-        canvas.width = img.width * ratio; canvas.height = img.height * ratio;
-        const ctx = canvas.getContext("2d");
-        ctx.clearRect(0, 0, canvas.width, canvas.height);
-        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-      };
-      img.src = url;
+    if (!pdf) return;
+    let cancelled = false;
+    pdf.getPage(idx).then((page) => {
+      if (cancelled) return;
+      const viewportBase = page.getViewport({ scale: 1 });
+      const scale = Math.min(1000 / viewportBase.width, 700 / viewportBase.height, 2);
+      const viewport = page.getViewport({ scale });
+      const canvas = canvasRef.current;
+      if (!canvas) return;
+      canvas.width = viewport.width;
+      canvas.height = viewport.height;
+      const ctx = canvas.getContext("2d");
+      page.render({ canvasContext: ctx, viewport });
     });
-    return () => { if (revoke) URL.revokeObjectURL(revoke); };
-  }, [slides, idx]);
+    return () => { cancelled = true; };
+  }, [pdf, idx]);
 
-  if (!course) {
+  if (!course || !course.pdf_path) {
     return (
       <div className="min-h-screen flex flex-col items-center justify-center px-6">
         <p className="text-sm" style={{ color: "#6B6B63" }}>Aucun cours n'est encore disponible pour cette formation.</p>
@@ -783,16 +771,15 @@ function CourseViewer({ course, onClose }) {
         <span className="mono text-xs" style={{ color: "#B3B0A6" }}>{course.titre}</span>
       </div>
       {loading && <p className="text-sm" style={{ color: "#B3B0A6" }}>Chargement du cours…</p>}
-      {!loading && slides.length === 0 && <p className="text-sm" style={{ color: "#B3B0A6" }}>Ce cours ne contient pas encore de contenu.</p>}
-      {slides.length > 0 && (
+      {!loading && numPages > 0 && (
         <>
           <div className="rounded-xl overflow-hidden shadow-lg border bg-white" style={{ borderColor: "#E4E1D8" }}>
             <canvas ref={canvasRef} className="max-w-full" style={{ display: "block" }} onContextMenu={(e) => e.preventDefault()} draggable={false} />
           </div>
           <div className="flex items-center gap-4 mt-5">
-            <button onClick={() => setIdx((i) => Math.max(0, i - 1))} disabled={idx === 0} className="px-4 py-2 rounded-lg text-sm font-semibold disabled:opacity-30" style={{ background: "#14171F", color: "#fff" }}>‹ Précédent</button>
-            <span className="mono text-xs" style={{ color: "#6B6B63" }}>{idx + 1} / {slides.length}</span>
-            <button onClick={() => setIdx((i) => Math.min(slides.length - 1, i + 1))} disabled={idx === slides.length - 1} className="px-4 py-2 rounded-lg text-sm font-semibold disabled:opacity-30" style={{ background: "#14171F", color: "#fff" }}>Suivant ›</button>
+            <button onClick={() => setIdx((i) => Math.max(1, i - 1))} disabled={idx === 1} className="px-4 py-2 rounded-lg text-sm font-semibold disabled:opacity-30" style={{ background: "#14171F", color: "#fff" }}>‹ Précédent</button>
+            <span className="mono text-xs" style={{ color: "#6B6B63" }}>{idx} / {numPages}</span>
+            <button onClick={() => setIdx((i) => Math.min(numPages, i + 1))} disabled={idx === numPages} className="px-4 py-2 rounded-lg text-sm font-semibold disabled:opacity-30" style={{ background: "#14171F", color: "#fff" }}>Suivant ›</button>
           </div>
           <p className="text-[11px] mt-6 text-center max-w-sm" style={{ color: "#B3B0A6" }}>Ce contenu est réservé à votre usage personnel dans le cadre de votre formation. Merci de ne pas le partager.</p>
         </>
